@@ -34,14 +34,76 @@ URL = {"a": "http://127.0.0.1:8001", "b": "http://127.0.0.1:8002"}
 LOG = pathlib.Path("reports/failover-events.jsonl")
 
 
+import datetime
+
 def emit(**kw):
-    """TODO: append 1 dòng JSONL có ts + iso vào LOG, và print ra stdout."""
-    raise NotImplementedError
+    """Ghi log JSONL và in ra stdout."""
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    evt = {"ts": time.time(), "iso": datetime.datetime.utcnow().isoformat() + "Z", **kw}
+    s = json.dumps(evt)
+    with open(LOG, "a") as f:
+        f.write(s + "\n")
+    print(s)
 
 
 def failover(target: str, backend: str, wait: float) -> dict:
-    """TODO: 5 bước ở trên, đúng thứ tự."""
-    raise NotImplementedError
+    """Thực hiện failover sang region đích qua 5 bước tuần tự."""
+    ret = {"ok": False}
+    try:
+        # 1_verify_target
+        try:
+            r = httpx.get(f"{URL[target]}/v1/state", timeout=2.0)
+            emit(step="1_verify_target", state=r.json())
+        except Exception as e:
+            emit(step="1_verify_target", error=str(e))
+            # Vẫn tiếp tục vì có thể process đang up nhưng state rỗng.
+
+        # 2_restore_snapshot
+        primary = "a" if target == "b" else "b"
+        snap = snapshot.get(target, backend)
+        
+        primary_db = pathlib.Path(f"state/region-{primary}/vectors.sqlite")
+        restored_db = pathlib.Path(f"state/region-{target}/vectors.sqlite")
+        rpo_res = snapshot.rpo(primary_db, restored_db)
+        
+        emit(step="2_restore_snapshot",
+             rpo_seconds=rpo_res.get("rpo_seconds"),
+             docs_lost=rpo_res.get("docs_lost"),
+             embed_model_version=snap.get("embed_model_version"))
+
+        # 3_scale_pool
+        pool_file = pathlib.Path(f"state/region-{target}/pool_state")
+        pool_file.parent.mkdir(parents=True, exist_ok=True)
+        pool_file.write_text("full")
+        emit(step="3_scale_pool")
+
+        # 4_wait_ready
+        start_t = time.time()
+        ready = False
+        while time.time() - start_t < wait:
+            try:
+                res = httpx.get(f"{URL[target]}/readyz", timeout=1.0)
+                if res.status_code == 200:
+                    ready = True
+                    break
+            except httpx.ConnectError:
+                pass
+            time.sleep(0.5)
+        
+        if not ready:
+            emit(step="4_wait_ready", status="timeout")
+            return ret
+        emit(step="4_wait_ready", status="ok")
+
+        # 5_dns_cutover
+        pathlib.Path("edge/active_region").write_text(target)
+        emit(step="5_dns_cutover", target=target)
+        
+        ret["ok"] = True
+        return ret
+    except Exception as e:
+        emit(step="error", msg=str(e))
+        return ret
 
 
 if __name__ == "__main__":

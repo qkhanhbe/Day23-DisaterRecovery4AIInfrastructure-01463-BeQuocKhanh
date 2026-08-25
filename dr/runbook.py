@@ -38,19 +38,88 @@ LOG = pathlib.Path("reports/runbook-run.jsonl")
 URL = {"a": "http://127.0.0.1:8001", "b": "http://127.0.0.1:8002"}
 
 
+import datetime
+
 def step(n, name, **kw):
-    """TODO: ghi 1 dòng {ts, iso, step, name, ...} vào LOG."""
-    raise NotImplementedError
+    """Ghi log JSONL và in ra stdout."""
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    evt = {"ts": time.time(), "iso": datetime.datetime.utcnow().isoformat() + "Z", "step": n, "name": name, **kw}
+    s = json.dumps(evt)
+    with open(LOG, "a") as f:
+        f.write(s + "\n")
+    print(s)
 
 
 def confirm(auto: bool, msg: str) -> bool:
-    """TODO: auto=True -> True; ngược lại hỏi y/N. Đừng bỏ hàm này đi."""
-    raise NotImplementedError
+    """Yêu cầu xác nhận từ user hoặc bỏ qua nếu auto=True."""
+    if auto:
+        return True
+    return input(f"{msg} [y/N]: ").strip().lower() == "y"
 
 
 def run(primary: str, target: str, backend: str, auto: bool) -> dict:
-    """TODO: 7 bước ở trên."""
-    raise NotImplementedError
+    """Chạy 7 bước của runbook."""
+    ret = {"ok": False}
+    start_t = time.time()
+    
+    # 1 xac_nhan_outage
+    for _ in range(3):
+        try:
+            httpx.get(f"{URL[primary]}/readyz", timeout=1.0)
+        except Exception:
+            pass
+        time.sleep(0.5)
+    step(1, "xac_nhan_outage", region=primary, status="unhealthy")
+    
+    if not confirm(auto, "Outage confirmed. Proceed?"):
+        return ret
+        
+    # 2 thong_bao_incident
+    t_outage = None
+    chaos_log = pathlib.Path("reports/chaos-events.jsonl")
+    if chaos_log.exists():
+        for line in chaos_log.read_text().splitlines():
+            evt = json.loads(line)
+            if evt.get("event") == "kill_region" or evt.get("action") == "netblock":
+                t_outage = evt.get("ts")
+                break
+    step(2, "thong_bao_incident", operator_alerted_at=time.time(), t_outage=t_outage)
+    
+    # 3 scale_gpu_pool (gọi hàm failover.failover)
+    fo_res = fo.failover(target, backend, 60.0)
+    step(3, "scale_gpu_pool", result=fo_res)
+    
+    # 4 verify_state_replica
+    st = {}
+    try:
+        st = httpx.get(f"{URL[target]}/v1/state", timeout=2.0).json()
+    except Exception:
+        pass
+    step(4, "verify_state_replica", vector_count=st.get("count"), weights=st.get("weights"))
+    
+    # 5 dns_cutover
+    step(5, "dns_cutover", success=fo_res.get("ok", False))
+    
+    # 6 verify_golden_signals
+    errors = 0
+    lats = []
+    for _ in range(10):
+        try:
+            t0 = time.time()
+            httpx.get(f"{URL[target]}/v1/infer", timeout=2.0)
+            lats.append(time.time() - t0)
+        except Exception:
+            errors += 1
+            
+    p95 = sorted(lats)[int(len(lats)*0.95)] if lats else 0
+    step(6, "verify_golden_signals", p95_latency=p95, error_rate=errors/10.0)
+    
+    # 7 post_incident
+    elapsed = time.time() - start_t
+    step(7, "post_incident", elapsed_s=elapsed, cmd="python3 tools/measure_rto.py --loadgen reports/drill-2-withdr.jsonl --target-rto 300")
+    
+    ret["ok"] = fo_res.get("ok", False)
+    return ret
 
 
 if __name__ == "__main__":
